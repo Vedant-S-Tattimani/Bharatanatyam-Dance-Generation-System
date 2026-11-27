@@ -14,7 +14,7 @@ Features:
   - Checks whether any full song-to-dance sequences exist.
 
 Usage:
-  python scripts/inventory.py --data-dir data/adavus --output data/inventory_report.json
+  python scripts/inventory.py --data-dir data/adavus --output docs/inventory_report.json
 """
 
 import argparse
@@ -55,8 +55,23 @@ REQUIRED_BODY_INDICES = (11, 12, 23, 24, 25, 26, 27, 28)
 MIN_POSE_VISIBILITY = 0.5
 MIN_HAND_BBOX_PX = 40.0  # Minimum hand bounding box size in pixels for reliable mudra landmarks
 
-DEFAULT_POSE_MODEL = Path(__file__).resolve().parent.parent / "models" / "weights" / "mediapipe" / "pose_landmarker_full.task"
-DEFAULT_HAND_MODEL = Path(__file__).resolve().parent.parent / "models" / "weights" / "mediapipe" / "hand_landmarker.task"
+DEFAULT_POSE_MODEL = Path(__file__).resolve().parent.parent / "data" / "models" / "mediapipe" / "pose_landmarker_full.task"
+DEFAULT_HAND_MODEL = Path(__file__).resolve().parent.parent / "data" / "models" / "mediapipe" / "hand_landmarker.task"
+DEFAULT_OVERRIDES_PATH = Path(__file__).resolve().parent / "mapping_overrides.json"
+
+
+def load_overrides(overrides_path: Path | None) -> dict:
+    """Load non-destructive mapping overrides JSON if provided and present."""
+    if not overrides_path or not overrides_path.is_file():
+        return {"loaded": False, "path": None, "path_aliases": {}, "category_renames": {}, "filename_overrides": {}}
+    data = json.loads(overrides_path.read_text(encoding="utf-8"))
+    return {
+        "loaded": True,
+        "path": str(overrides_path),
+        "path_aliases": data.get("path_aliases", {}),
+        "category_renames": data.get("category_renames", {}),
+        "filename_overrides": data.get("filename_overrides", {}),
+    }
 
 
 def parse_dataset_card(readme_path: Path) -> dict:
@@ -79,24 +94,37 @@ def parse_dataset_card(readme_path: Path) -> dict:
     }
 
 
-def read_mapping_xlsx(data_dir: Path) -> dict:
+def read_mapping_xlsx(data_dir: Path, overrides: dict | None = None) -> dict:
     """
     Read adavus_mapping.xlsx and merge alternate names per canonical adavu.
+    Applies optional non-destructive overrides without modifying dataset files.
 
     Returns dict with:
-      - by_filename: {basename: {raw_video_name, canonical, alternates, row_num, path_typo}}
+      - by_filename: {basename: {raw_video_name, canonical, alternates, row_num, path_typo, override_applied}}
       - canonical_alternates: {canonical: sorted list of alternate names}
       - discrepancies: list of mapping issues (blank rows, path typos, etc.)
+      - overrides_applied: list of overrides applied
     """
+    overrides = overrides or {}
+    path_aliases = overrides.get("path_aliases", {})
+    category_renames = overrides.get("category_renames", {})
+    filename_overrides = overrides.get("filename_overrides", {})
+
     xlsx_path = data_dir / "adavus_mapping.xlsx"
     if not xlsx_path.exists():
         hits = list(data_dir.rglob("*.xlsx"))
         if not hits:
-            return {"found": False, "by_filename": {}, "canonical_alternates": {}, "discrepancies": ["adavus_mapping.xlsx not found"]}
+            return {
+                "found": False, "by_filename": {}, "canonical_alternates": {},
+                "discrepancies": ["adavus_mapping.xlsx not found"], "overrides_applied": [],
+            }
         xlsx_path = hits[0]
 
     if openpyxl is None:
-        return {"found": False, "by_filename": {}, "canonical_alternates": {}, "discrepancies": ["openpyxl unavailable"]}
+        return {
+            "found": False, "by_filename": {}, "canonical_alternates": {},
+            "discrepancies": ["openpyxl unavailable"], "overrides_applied": [],
+        }
 
     wb = openpyxl.load_workbook(str(xlsx_path), read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -104,6 +132,7 @@ def read_mapping_xlsx(data_dir: Path) -> dict:
     by_filename = {}
     canonical_alternates = defaultdict(set)
     discrepancies = []
+    overrides_applied = []
 
     for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
         vals = [str(c).strip() if c is not None else "" for c in row]
@@ -114,15 +143,24 @@ def read_mapping_xlsx(data_dir: Path) -> dict:
             continue
 
         raw_vname = vals[0]
+        resolved_vname = path_aliases.get(raw_vname, raw_vname)
         adavu1 = vals[1] if len(vals) > 1 else ""
         alts = [v for v in vals[2:] if v]
 
         path_typo = False
         if raw_vname.startswith("vidoes/"):
             path_typo = True
-            discrepancies.append(f"Row {row_idx}: folder typo '{raw_vname}' (expected 'videos/...')")
+            if raw_vname in path_aliases:
+                overrides_applied.append(f"Row {row_idx}: path_alias '{raw_vname}' -> '{resolved_vname}'")
+            else:
+                discrepancies.append(f"Row {row_idx}: folder typo '{raw_vname}' (expected 'videos/...')")
 
-        fname = Path(raw_vname.replace("\\", "/")).name
+        if adavu1 in category_renames:
+            renamed = category_renames[adavu1]
+            overrides_applied.append(f"Row {row_idx}: category_rename '{adavu1}' -> '{renamed}'")
+            adavu1 = renamed
+
+        fname = Path(resolved_vname.replace("\\", "/")).name
         if fname in by_filename:
             discrepancies.append(f"Row {row_idx}: duplicate video entry '{fname}'")
 
@@ -132,9 +170,36 @@ def read_mapping_xlsx(data_dir: Path) -> dict:
             "alternates": alts,
             "row_num": row_idx,
             "path_typo": path_typo,
+            "override_applied": raw_vname != resolved_vname or (vals[1] if len(vals) > 1 else "") in category_renames,
         }
         for a in alts:
             canonical_alternates[adavu1].add(a)
+
+    # Apply filename overrides (e.g. MandiAdavu2.mp4 replacing missing MandiAdavu12.mp4)
+    for fname, ov in filename_overrides.items():
+        canonical = category_renames.get(ov["canonical"], ov["canonical"])
+        alts = list(ov.get("alternates", []))
+        replaces = ov.get("replaces_missing_excel_entry")
+        if replaces:
+            rep_fname = Path(replaces.replace("\\", "/")).name
+            if rep_fname in by_filename:
+                del by_filename[rep_fname]
+                overrides_applied.append(
+                    f"filename_override: replaced missing '{replaces}' with '{fname}' -> '{canonical}'"
+                )
+        else:
+            overrides_applied.append(f"filename_override: '{fname}' -> '{canonical}'")
+        by_filename[fname] = {
+            "raw_video_name": f"videos/{fname}",
+            "canonical": canonical,
+            "alternates": alts,
+            "row_num": None,
+            "path_typo": False,
+            "override_applied": True,
+            "confirmed_by_user": ov.get("confirmed_by_user", False),
+        }
+        for a in alts:
+            canonical_alternates[canonical].add(a)
 
     wb.close()
     return {
@@ -144,6 +209,7 @@ def read_mapping_xlsx(data_dir: Path) -> dict:
         "by_filename": by_filename,
         "canonical_alternates": {k: sorted(v) for k, v in sorted(canonical_alternates.items())},
         "discrepancies": discrepancies,
+        "overrides_applied": overrides_applied,
     }
 
 
@@ -405,9 +471,10 @@ def check_song_sequences(data_dir: Path, clips: list[dict]) -> dict:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default="data/adavus", help="Path to downloaded dataset directory")
-    ap.add_argument("--output", default="data/inventory_report.json", help="Output JSON report path")
+    ap.add_argument("--output", default="docs/inventory_report.json", help="Output JSON report path")
     ap.add_argument("--pose-model", default=str(DEFAULT_POSE_MODEL), help="MediaPipe pose_landmarker .task path")
     ap.add_argument("--hand-model", default=str(DEFAULT_HAND_MODEL), help="MediaPipe hand_landmarker .task path")
+    ap.add_argument("--overrides", default=str(DEFAULT_OVERRIDES_PATH), help="Optional mapping overrides JSON path")
     ap.add_argument("--sample-frames", type=int, default=5, help="Sample frames per clip for body/hand checks")
     ap.add_argument("--max-clips", type=int, default=0, help="Limit clips scanned (0 = all)")
     args = ap.parse_args()
@@ -433,8 +500,9 @@ def main():
             f"  hand: {args.hand_model}"
         )
 
+    overrides = load_overrides(Path(args.overrides) if args.overrides else None)
     card = parse_dataset_card(data_dir / "README.md")
-    mapping = read_mapping_xlsx(data_dir)
+    mapping = read_mapping_xlsx(data_dir, overrides=overrides)
 
     all_videos = sorted(
         p for p in data_dir.rglob("*")
@@ -514,6 +582,10 @@ def main():
             "audio_present_count": sum(1 for c in group if c.get("has_audio") is True),
             "full_body_visible_count": sum(1 for c in valid if c["visibility"].get("full_body_visible")),
             "hands_mudra_ready_count": sum(1 for c in valid if c["visibility"].get("hands_mudra_ready")),
+            "both_passing_count": sum(
+                1 for c in valid
+                if c["visibility"].get("full_body_visible") and c["visibility"].get("hands_mudra_ready")
+            ),
             "duration_min_s": round(min(durs), 2) if durs else 0.0,
             "duration_max_s": round(max(durs), 2) if durs else 0.0,
             "duration_total_s": round(sum(durs), 2) if durs else 0.0,
@@ -521,17 +593,19 @@ def main():
 
     # Compare against dataset card
     card_diffs = list(mapping.get("discrepancies", []))
+    renames = overrides.get("category_renames", {})
+    expected_card_cats = {renames.get(k, k): v for k, v in card["categories"].items()}
     if args.max_clips == 0:
         if len(clips) != card["total_expected"]:
             card_diffs.append(f"Total clips: found {len(clips)}, dataset card expects {card['total_expected']}")
         actual_cats = {k for k in per_adavu if k != "UNMAPPED"}
         if len(actual_cats) != EXPECTED_CATEGORIES:
             card_diffs.append(f"Category count: found {len(actual_cats)}, dataset card expects {EXPECTED_CATEGORIES}")
-        for cat, exp_n in card["categories"].items():
+        for cat, exp_n in expected_card_cats.items():
             act_n = per_adavu.get(cat, {}).get("clip_count", 0)
             if act_n != exp_n:
                 card_diffs.append(f"Category '{cat}': found {act_n} clips, dataset card expects {exp_n}")
-        for cat in actual_cats - set(card["categories"].keys()):
+        for cat in actual_cats - set(expected_card_cats.keys()):
             card_diffs.append(f"Category '{cat}' present in mapping but not listed on dataset card")
         if missing_on_disk:
             card_diffs.append(f"Files listed in adavus_mapping.xlsx but missing on disk: {missing_on_disk}")
@@ -561,6 +635,11 @@ def main():
         "audio_absent_count": sum(1 for c in clips if c.get("has_audio") is False),
         "full_body_visible_count": sum(1 for c in valid_clips if c["visibility"].get("full_body_visible")),
         "hands_mudra_ready_count": sum(1 for c in valid_clips if c["visibility"].get("hands_mudra_ready")),
+        "both_passing_count": sum(
+            1 for c in valid_clips
+            if c["visibility"].get("full_body_visible") and c["visibility"].get("hands_mudra_ready")
+        ),
+        "overrides_applied": mapping.get("overrides_applied", []),
         "differences_from_card": card_diffs,
     }
 
@@ -597,19 +676,23 @@ def main():
     print("\n" + "=" * 78, file=sys.stderr)
     print(f"INVENTORY SUMMARY ({summary['total_clips']} clips, {summary['total_categories']} categories)", file=sys.stderr)
     print("=" * 78, file=sys.stderr)
-    print(f"Broken: {summary['broken_files']} | Audio: {summary['audio_present_count']}/{summary['total_clips']} | Full body: {summary['full_body_visible_count']}/{len(valid_clips)} | Hands mudra-ready: {summary['hands_mudra_ready_count']}/{len(valid_clips)}", file=sys.stderr)
+    print(f"Broken: {summary['broken_files']} | Audio: {summary['audio_present_count']}/{summary['total_clips']} | Full body: {summary['full_body_visible_count']}/{len(valid_clips)} | Hands mudra-ready: {summary['hands_mudra_ready_count']}/{len(valid_clips)} | Both: {summary['both_passing_count']}/{len(valid_clips)}", file=sys.stderr)
     print(f"Resolutions: {resolutions} | FPS: {fps_vals} | Total dur: {summary['total_duration_min']} min", file=sys.stderr)
-    print(f"\n{'Adavu':<26} {'Clips':>5} {'Card':>5} {'Body':>5} {'Hands':>5} {'Audio':>5}  Alternates merged", file=sys.stderr)
-    print("-" * 78, file=sys.stderr)
+    print(f"\n{'Adavu':<26} {'Clips':>5} {'Card':>5} {'Body':>5} {'Hands':>5} {'Both':>5} {'Audio':>5}  Alternates merged", file=sys.stderr)
+    print("-" * 84, file=sys.stderr)
     for adavu, s in per_adavu.items():
         alts = ", ".join(s["alternate_names_merged"]) or "-"
         card_n = str(s["expected_in_card"]) if s["expected_in_card"] is not None else "?"
         print(
             f"{adavu:<26} {s['clip_count']:>5} {card_n:>5} "
-            f"{s['full_body_visible_count']:>5} {s['hands_mudra_ready_count']:>5} "
+            f"{s['full_body_visible_count']:>5} {s['hands_mudra_ready_count']:>5} {s['both_passing_count']:>5} "
             f"{s['audio_present_count']:>5}  {alts}",
             file=sys.stderr,
         )
+    if summary["overrides_applied"]:
+        print("\nOverrides applied (non-destructive):", file=sys.stderr)
+        for o in summary["overrides_applied"]:
+            print(f"  * {o}", file=sys.stderr)
     if card_diffs:
         print("\nDifferences / Discrepancies:", file=sys.stderr)
         for d in card_diffs:

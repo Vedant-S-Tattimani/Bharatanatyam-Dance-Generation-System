@@ -1,0 +1,19 @@
+{
+  "_comment": "Non-destructive overrides applied on top of data/adavus/adavus_mapping.xlsx without modifying original dataset files.",
+  "path_aliases": {
+    "vidoes/ThaHathaJamThariThaAdavu _ Kalakshetra style.mp4": "videos/ThaHathaJamThariThaAdavu _ Kalakshetra style.mp4"
+  },
+  "category_renames": {
+    "KattiASdavu": "KattiAdavu"
+  },
+  "filename_overrides": {
+    "MandiAdavu2.mp4": {
+      "canonical": "MandiAdavu",
+      "alternates": [],
+      "replaces_missing_excel_entry": "videos/MandiAdavu12.mp4",
+      "confirmed_by_user": false,
+      "note": "Excel lists videos/MandiAdavu12.mp4 (missing on disk); videos/MandiAdavu2.mp4 exists on disk. Pending user confirmation."
+    }
+  }
+}
+
