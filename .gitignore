@@ -1,0 +1,38 @@
+# === Dataset, extracted motion, model weights (CC BY-NC-ND 4.0, local only) ===
+data/
+models/weights/
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# === Node / Frontend ===
+node_modules/
+.next/
+out/
+
+# === Environment & secrets ===
+.env
+.env.local
+.env.*.local
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS ===
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# === Logs ===
+*.log
+npm-debug.log*
+
