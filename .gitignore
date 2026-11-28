@@ -1,6 +1,11 @@
-# === Dataset, extracted motion, model weights (CC BY-NC-ND 4.0, local only) ===
+# === Dataset, extracted motion, model weights, previews, audio, catalogues (local only) ===
 data/
 models/weights/
+output/
+previews/
+*.mp4
+*.wav
+*.mp3
 
 # === Python ===
 __pycache__/
