@@ -5,13 +5,6 @@
   const $ = (id) => document.getElementById(id);
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-  const POSE_EDGES = [
-    [11, 12], [11, 23], [12, 24], [23, 24],
-    [11, 13], [13, 15], [12, 14], [14, 16],
-    [23, 25], [25, 27], [27, 29], [29, 31],
-    [24, 26], [26, 28], [28, 30], [30, 32],
-    [0, 11], [0, 12],
-  ];
   const HAND_EDGES = [
     [0, 1], [1, 2], [2, 3], [3, 4],
     [0, 5], [5, 6], [6, 7], [7, 8],
@@ -19,8 +12,6 @@
     [9, 13], [13, 14], [14, 15], [15, 16],
     [13, 17], [17, 18], [18, 19], [19, 20], [0, 17],
   ];
-  const KEY_JOINTS = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
-
   // A real resting Nattadavu frame from the local extracted motion catalogue.
   const IDLE_FRAME = {
     pose_world: [[0.094,-1.23,-0.644],[0.113,-1.302,-0.605],[0.114,-1.303,-0.603],[0.114,-1.304,-0.603],[0.047,-1.299,-0.607],[0.047,-1.3,-0.609],[0.048,-1.303,-0.606],[0.208,-1.266,-0.374],[-0.087,-1.27,-0.406],[0.137,-1.179,-0.561],[0.048,-1.176,-0.566],[0.399,-0.955,-0.266],[-0.298,-1.003,-0.239],[0.899,-0.933,-0.299],[-0.804,-0.918,-0.135],[1.365,-0.983,-0.476],[-1.231,-0.893,-0.271],[1.47,-0.982,-0.503],[-1.334,-0.89,-0.265],[1.477,-1.026,-0.566],[-1.339,-0.935,-0.345],[1.381,-0.995,-0.511],[-1.248,-0.896,-0.309],[0.201,-0.009,-0.054],[-0.202,0.009,0.057],[0.52,0.697,-0.241],[-0.146,0.774,0.262],[1.119,1.207,-0.193],[-0.043,1.414,0.646],[1.209,1.269,-0.204],[-0.047,1.502,0.666],[1.431,1.288,-0.41],[-0.233,1.575,0.472]],
@@ -47,6 +38,12 @@
     sourceAvailable: true,
     progressTimers: [],
     lastBeatIndex: -1,
+    referenceAtlas: null,
+    referenceInfo: null,
+    showReference: true,
+    dancer3D: null,
+    dancer3DActive: false,
+    rigInfo: null,
   };
 
   const canvas = $('dancerCanvas');
@@ -114,12 +111,203 @@
     canvas.width = Math.round(canvasW * dpr);
     canvas.height = Math.round(canvasH * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (state.dancer3DActive && state.dancer3D && typeof state.dancer3D.resize === 'function') {
+      state.dancer3D.resize(canvasW, canvasH);
+    }
+  }
+
+  const SKIN_NEAR = { dark: '#8b4b3b', mid: '#d99a74', light: '#f3c79f' };
+  const SKIN_FAR = { dark: '#502a26', mid: '#955b46', light: '#c68a68' };
+
+  function midPoint(a, b, t = 0.5) {
+    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  }
+
+  function drawTaperedLimb(a, b, startW, endW, palette) {
+    if (!a || !b) return;
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const len = Math.max(Math.hypot(dx, dy), 1e-6);
+    const nx = -dy / len;
+    const ny = dx / len;
+    const grad = ctx.createLinearGradient(
+      a[0] - nx * startW, a[1] - ny * startW,
+      b[0] + nx * endW, b[1] + ny * endW
+    );
+    grad.addColorStop(0, palette.dark);
+    grad.addColorStop(0.48, palette.mid);
+    grad.addColorStop(1, palette.light);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(a[0] + nx * startW, a[1] + ny * startW);
+    ctx.lineTo(b[0] + nx * endW, b[1] + ny * endW);
+    ctx.lineTo(b[0] - nx * endW, b[1] - ny * endW);
+    ctx.lineTo(a[0] - nx * startW, a[1] - ny * startW);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(52,24,32,0.22)';
+    ctx.lineWidth = Math.max(0.6, startW * 0.08);
+    ctx.stroke();
+  }
+
+  function drawJoint(p, r, palette) {
+    if (!p) return;
+    const g = ctx.createRadialGradient(p[0] - r * 0.3, p[1] - r * 0.3, r * 0.1, p[0], p[1], r);
+    g.addColorStop(0, palette.light);
+    g.addColorStop(1, palette.dark);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawSkirt(pts, scale, floorY) {
+    const lh = pts[23];
+    const rh = pts[24];
+    const lk = pts[25];
+    const rk = pts[26];
+    const la = pts[27];
+    const ra = pts[28];
+    if (!lh || !rh || !lk || !rk || !la || !ra) return;
+    const hipMid = midPoint(lh, rh);
+    const kneeY = Math.max(lk[1], rk[1]);
+    const ankleY = Math.max(la[1], ra[1]);
+    const hemY = Math.min(floorY - scale * 0.04, kneeY + Math.max(scale * 0.12, (ankleY - kneeY) * 0.45));
+    const half = Math.max(scale * 0.30, Math.abs(la[0] - ra[0]) * 0.55, Math.abs(lh[0] - rh[0]) * 1.5);
+    const bottomL = [hipMid[0] - half, hemY];
+    const bottomR = [hipMid[0] + half, hemY];
+    const grad = ctx.createLinearGradient(hipMid[0], hipMid[1], hipMid[0], hemY);
+    grad.addColorStop(0, '#b3243f');
+    grad.addColorStop(0.55, '#7f1834');
+    grad.addColorStop(1, '#4d1028');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(lh[0], lh[1]);
+    ctx.quadraticCurveTo(hipMid[0], hipMid[1] + scale * 0.09, rh[0], rh[1]);
+    ctx.lineTo(bottomR[0], bottomR[1]);
+    ctx.quadraticCurveTo(hipMid[0], hemY + scale * 0.07, bottomL[0], bottomL[1]);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.lineWidth = Math.max(1, scale * 0.012);
+    for (let i = 0; i <= 9; i++) {
+      const t = i / 9;
+      const top = midPoint(lh, rh, t);
+      const bottom = midPoint(bottomL, bottomR, t);
+      ctx.strokeStyle = i % 2 ? 'rgba(247,203,132,0.30)' : 'rgba(24,5,14,0.26)';
+      ctx.beginPath();
+      ctx.moveTo(top[0], top[1]);
+      ctx.quadraticCurveTo(midPoint(top, bottom)[0] + scale * 0.02 * (i - 4.5) / 4.5, midPoint(top, bottom)[1], bottom[0], bottom[1]);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(247,203,132,0.78)';
+    ctx.lineWidth = Math.max(1.2, scale * 0.018);
+    ctx.beginPath();
+    ctx.moveTo(bottomL[0], bottomL[1]);
+    ctx.quadraticCurveTo(hipMid[0], hemY + scale * 0.07, bottomR[0], bottomR[1]);
+    ctx.stroke();
+  }
+
+  function drawBlouse(pts, scale) {
+    const ls = pts[11];
+    const rs = pts[12];
+    const lh = pts[23];
+    const rh = pts[24];
+    if (!ls || !rs || !lh || !rh) return;
+    const shoulderMid = midPoint(ls, rs);
+    const hipMid = midPoint(lh, rh);
+    const grad = ctx.createLinearGradient(shoulderMid[0] - scale * 0.22, 0, shoulderMid[0] + scale * 0.22, 0);
+    grad.addColorStop(0, '#1f6c62');
+    grad.addColorStop(0.5, '#62c7b0');
+    grad.addColorStop(1, '#164e4b');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(ls[0], ls[1]);
+    ctx.quadraticCurveTo(shoulderMid[0], shoulderMid[1] - scale * 0.07, rs[0], rs[1]);
+    ctx.lineTo(rh[0], rh[1]);
+    ctx.quadraticCurveTo(hipMid[0], hipMid[1] + scale * 0.09, lh[0], lh[1]);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(247,203,132,0.80)';
+    ctx.lineWidth = Math.max(1, scale * 0.014);
+    ctx.beginPath();
+    ctx.moveTo(ls[0] + scale * 0.03, ls[1] + scale * 0.03);
+    ctx.quadraticCurveTo(shoulderMid[0], shoulderMid[1] + scale * 0.16, rs[0] - scale * 0.03, rs[1] + scale * 0.03);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(lh[0], lh[1]);
+    ctx.quadraticCurveTo(hipMid[0], hipMid[1] + scale * 0.06, rh[0], rh[1]);
+    ctx.stroke();
+  }
+
+  function drawHead(pts, scale) {
+    const head = pts[0];
+    const ls = pts[11];
+    const rs = pts[12];
+    if (!head || !ls || !rs) return;
+    const r = scale * 0.112;
+    const shoulderMid = midPoint(ls, rs);
+    drawTaperedLimb([head[0], head[1] + r * 0.55], shoulderMid, scale * 0.038, scale * 0.055, SKIN_NEAR);
+
+    ctx.fillStyle = '#160f1c';
+    ctx.beginPath();
+    ctx.ellipse(head[0] - r * 0.66, head[1] - r * 0.92, r * 0.44, r * 0.40, -0.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(head[0], head[1] - r * 0.55, r * 0.98, r * 0.86, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    const face = ctx.createRadialGradient(head[0] - r * 0.32, head[1] - r * 0.55, r * 0.12, head[0], head[1] - r * 0.28, r);
+    face.addColorStop(0, '#f8dfae');
+    face.addColorStop(1, '#bd7c43');
+    ctx.fillStyle = face;
+    ctx.beginPath();
+    ctx.ellipse(head[0], head[1] - r * 0.28, r * 0.76, r * 0.88, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(247,203,132,0.85)';
+    ctx.lineWidth = Math.max(1, scale * 0.011);
+    ctx.beginPath();
+    ctx.arc(head[0], head[1] - r * 0.42, r * 0.83, Math.PI * 1.08, Math.PI * 1.92);
+    ctx.stroke();
+    ctx.fillStyle = '#e6785b';
+    ctx.beginPath();
+    ctx.arc(head[0], head[1] - r * 0.34, r * 0.11, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(30,16,22,0.75)';
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.ellipse(head[0] + side * r * 0.28, head[1] - r * 0.30, r * 0.08, r * 0.045, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#e8b74f';
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(head[0] + side * r * 0.78, head[1] - r * 0.12, r * 0.10, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawBangles(p, scale, color) {
+    if (!p) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(1, scale * 0.012);
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.ellipse(p[0], p[1] + i * scale * 0.018, scale * (0.048 + i * 0.004), scale * 0.014, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
 
   function drawStage(frame, timeSec, idlePhase) {
     const w = canvasW;
     const h = canvasH;
     if (!w || !h) return;
+    if (state.dancer3DActive) {
+      if (typeof ctx.clearRect === 'function') ctx.clearRect(0, 0, w, h);
+      drawSourceSculpt();
+      return;
+    }
     const floorY = h * 0.84;
 
     const bg = ctx.createLinearGradient(0, 0, 0, h);
@@ -206,59 +394,65 @@
       ctx.restore();
     }
 
-    // Body limbs, far-to-near for a little depth.
-    const edges = POSE_EDGES.map(([a, b]) => ({ a, b, z: ((pose[a] && pose[a][2]) || 0) + ((pose[b] && pose[b][2]) || 0) }));
-    edges.sort((p, q) => q.z - p.z);
+    // Procedural female mannequin, shaded as a 3D projection of the real pose_world joints.
+    const zSum = (i, j) => ((pose[i] && pose[i][2]) || 0) + ((pose[j] && pose[j][2]) || 0);
+    const leftArmZ = zSum(11, 13) + zSum(13, 15);
+    const rightArmZ = zSum(12, 14) + zSum(14, 16);
+    const leftLegZ = zSum(23, 25) + zSum(25, 27);
+    const rightLegZ = zSum(24, 26) + zSum(26, 28);
+    const leftArmIsFar = leftArmZ < rightArmZ;
+    const leftLegIsFar = leftLegZ < rightLegZ;
+    const armFar = leftArmIsFar ? [11, 13, 15] : [12, 14, 16];
+    const armNear = leftArmIsFar ? [12, 14, 16] : [11, 13, 15];
+    const legFar = leftLegIsFar ? [23, 25, 27, 29, 31] : [24, 26, 28, 30, 32];
+    const legNear = leftLegIsFar ? [24, 26, 28, 30, 32] : [23, 25, 27, 29, 31];
+
+    const limb = (a, b, wa, wb, palette) => drawTaperedLimb(pts[a], pts[b], scale * wa, scale * wb, palette);
+    const drawArm = (idx, palette) => {
+      limb(idx[0], idx[1], 0.052, 0.040, palette);
+      limb(idx[1], idx[2], 0.040, 0.028, palette);
+      drawJoint(pts[idx[1]], scale * 0.031, palette);
+    };
+    const drawLeg = (idx, palette) => {
+      limb(idx[0], idx[1], 0.078, 0.055, palette);
+      limb(idx[1], idx[2], 0.055, 0.034, palette);
+      limb(idx[2], idx[3], 0.034, 0.026, palette);
+      limb(idx[3], idx[4], 0.026, 0.014, palette);
+      drawJoint(pts[idx[1]], scale * 0.038, palette);
+      drawJoint(pts[idx[2]], scale * 0.029, palette);
+    };
+
     ctx.save();
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    ctx.shadowColor = 'rgba(216,162,74,0.45)';
-    ctx.shadowBlur = scale * 0.09;
-    for (const e of edges) {
-      const a = pts[e.a];
-      const b = pts[e.b];
-      if (!a || !b) continue;
-      const isCore = e.a === 11 || e.a === 12 || e.a === 23 || e.a === 24;
-      ctx.strokeStyle = isCore ? '#f0c987' : '#d8a24a';
-      ctx.globalAlpha = clamp(0.82 + e.z * 0.04, 0.55, 1);
-      ctx.lineWidth = scale * (isCore ? 0.058 : 0.044);
-      ctx.beginPath();
-      ctx.moveTo(a[0], a[1]);
-      ctx.lineTo(b[0], b[1]);
-      ctx.stroke();
-    }
+    ctx.shadowColor = 'rgba(216,162,74,0.28)';
+    ctx.shadowBlur = scale * 0.05;
+
+    // Soft contact shadow keeps the figure grounded on the tala floor.
+    ctx.save();
+    ctx.globalAlpha = 0.30;
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.ellipse(cx, floorY, scale * 0.34, scale * 0.055, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    drawArm(armFar, SKIN_FAR);
+    drawLeg(legFar, SKIN_FAR);
+    drawLeg(legNear, SKIN_NEAR);
+    drawSkirt(pts, scale, floorY);
+    drawBlouse(pts, scale);
+    drawJoint(pts[11], scale * 0.040, SKIN_NEAR);
+    drawJoint(pts[12], scale * 0.040, SKIN_NEAR);
+    drawArm(armNear, SKIN_NEAR);
+    drawHead(pts, scale);
+
     ctx.shadowBlur = 0;
     ctx.globalAlpha = 1;
-    for (const i of KEY_JOINTS) {
-      const p = pts[i];
-      if (!p) continue;
-      ctx.fillStyle = '#f7f1e5';
-      ctx.beginPath();
-      ctx.arc(p[0], p[1], scale * 0.024, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Head with a simple crown/bindi detail.
-    const head = pts[0];
-    if (head) {
-      const r = scale * 0.108;
-      const face = ctx.createRadialGradient(head[0] - r * 0.35, head[1] - r * 0.4, r * 0.1, head[0], head[1], r);
-      face.addColorStop(0, '#f6dda8');
-      face.addColorStop(1, '#b8792f');
-      ctx.fillStyle = face;
-      ctx.beginPath();
-      ctx.arc(head[0], head[1], r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(98,199,176,0.75)';
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.arc(head[0], head[1], r * 1.13, Math.PI * 1.08, Math.PI * 1.92);
-      ctx.stroke();
-      ctx.fillStyle = '#e6785b';
-      ctx.beginPath();
-      ctx.arc(head[0], head[1] - r * 0.1, r * 0.13, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    drawBangles(pts[15], scale, '#e8b74f');
+    drawBangles(pts[16], scale, '#62c7b0');
+    drawBangles(pts[27], scale, 'rgba(232,182,79,0.85)');
+    drawBangles(pts[28], scale, 'rgba(98,199,176,0.85)');
     ctx.restore();
 
     // Genuine hand landmarks only — never invent missing ones.
@@ -304,6 +498,38 @@
       ctx.stroke();
     }
     ctx.restore();
+
+    drawSourceSculpt();
+  }
+
+  // The supplied FBX is a static, textureless sculpt. Frame 0 is drawn as a
+  // labelled reference tile only; it is never used as choreography or hand data.
+  function drawSourceSculpt() {
+    if (!state.referenceAtlas || !state.showReference) return;
+    const info = state.referenceInfo || {};
+    const columns = Number(info.grid?.columns) || 4;
+    const tile = Number(info.tile_size) || 512;
+    const frameCount = Number(info.frame_count) || 16;
+    const frame = clamp(0, 0, frameCount - 1);
+    const sx = (frame % columns) * tile;
+    const sy = Math.floor(frame / columns) * tile;
+    const cardW = Math.min(canvasW * 0.20, canvasH * 0.34);
+    const cardH = cardW * 1.28;
+    if (cardW < 64) return;
+    const x = canvasW * 0.035;
+    const y = canvasH - cardH - 54;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(14, 13, 19, 0.80)';
+    ctx.fillRect(x, y, cardW, cardH);
+    ctx.drawImage(state.referenceAtlas, sx, sy, tile, tile, x + cardW * 0.06, y + 8, cardW * 0.88, cardW * 0.88);
+    ctx.strokeStyle = 'rgba(240, 217, 157, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x + cardW * 0.08, y + cardW + 14);
+    ctx.lineTo(x + cardW * 0.92, y + cardW + 14);
+    ctx.stroke();
+    ctx.restore();
   }
 
   function beatPulseAt(t) {
@@ -339,9 +565,7 @@
 
   function updateHUD(t, info) {
     const frame = info.frame;
-    if (info.waiting) {
-      $('stageAdavu').textContent = `${frame.adavu || '—'} · waiting for sam`;
-    } else if (info.idle) {
+    if (info.idle) {
       $('stageAdavu').textContent = frame.adavu || 'resting pose';
     } else {
       const conf = frame.confirmed === false ? ' · unconfirmed' : '';
@@ -372,7 +596,7 @@
     const n = wave.children.length;
     for (let i = 0; i < n; i++) {
       const v = 0.5 + 0.5 * Math.sin(ts / 620 + i * 0.42) * Math.sin(ts / 1730 + i * 0.13);
-      wave.children[i].style.height = `${8 + v * 88}%`;
+      wave.children[i].style.transform = `scaleY(${0.08 + v * 0.88})`;
     }
   }
 
@@ -381,9 +605,34 @@
     const audio = $('audioEl');
     const t = state.frames.length ? Number(audio.currentTime) || 0 : 0;
     const info = frameAtTime(t);
-    drawStage(info.frame, t, info.idle ? ts / 1000 : 0);
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    drawStage(info.frame, t, info.idle && !reducedMotion ? ts / 1000 : 0);
+    if (state.dancer3DActive && state.dancer3D && typeof state.dancer3D.update === 'function') {
+      state.dancer3D.update(info.frame);
+    }
     updateHUD(t, info);
-    heroWaveTick(ts);
+    if (!reducedMotion) heroWaveTick(ts);
+  }
+
+  function updateProcessStack() {
+    const cards = document.querySelectorAll('.process-step');
+    if (!cards.length) return;
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const narrow = (window.innerWidth || 1200) <= 1050;
+    if (reduced || narrow) {
+      cards.forEach((card) => { card.style.transform = ''; });
+      return;
+    }
+    const section = $('how');
+    if (!section) return;
+    const rect = section.getBoundingClientRect();
+    const vh = window.innerHeight || 800;
+    const span = Math.max(rect.height + vh, 1);
+    const progress = clamp((vh - rect.top) / span, 0, 1);
+    cards.forEach((card, i) => {
+      const local = clamp(progress * 1.35 - i * 0.1, 0, 1);
+      card.style.transform = `scale(${(0.9 + local * 0.1).toFixed(3)})`;
+    });
   }
 
   /* ---------- UI population ---------- */
@@ -440,10 +689,22 @@
       pill.appendChild(dot);
       pill.appendChild(document.createTextNode(h.cuda_available ? 'GPU ready' : 'API ready'));
       pill.title = h.gpu_name ? `${h.gpu_name} · catalogue ${h.catalogue.total_units} units` : `Catalogue ${h.catalogue.total_units} units`;
+      const model = h.mudra_model || {};
+      $('modelStatus').textContent = model.available
+        ? `Hand-shape model ready${model.version ? ` · ${model.version}` : ''}`
+        : 'Hand-shape model optional · motion planning available';
+      $('modelVersion').textContent = model.available
+        ? `Model ${model.version || 'ready'}`
+        : 'Optional model offline';
+      $('modelDetails').textContent = model.available
+        ? 'The trained classifier ranks hand shapes from recorded poses; it supports movement selection rather than generating choreography.'
+        : 'The trained hand-shape prior is optional. Rhythm analysis and recorded-adavu choreography remain available without it.';
     } catch (err) {
       const pill = $('healthPill');
       pill.classList.add('pill-bad');
       pill.textContent = 'API offline';
+      $('modelStatus').textContent = 'Dance model status unavailable';
+      $('modelVersion').textContent = 'API unavailable';
     }
   }
 
@@ -508,6 +769,66 @@
     } catch (_) { /* recent jobs are optional */ }
   }
 
+  async function waitForDancer3D(timeoutMs = 6000) {
+    const started = Date.now();
+    while (!window.NrityaDancer3D && Date.now() - started < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+    return window.NrityaDancer3D || null;
+  }
+
+  async function loadRiggedSculpt(info) {
+    const api = await waitForDancer3D();
+    const rig = info && info.rig;
+    if (!api || !rig || !rig.available || !rig.glb_url || !rig.manifest) return;
+    await api.load({
+      mount: $('dancer3dMount'),
+      url: rig.glb_url,
+      manifest: rig.manifest,
+    });
+    api.resize(canvasW, canvasH);
+    api.update(state.frames.length ? state.frames[0] : IDLE_FRAME);
+    state.dancer3D = api;
+    state.dancer3DActive = true;
+    state.rigInfo = rig;
+    $('rigStatus').classList.remove('hidden');
+  }
+
+  async function loadReferenceModel() {
+    const img = new Image();
+    img.decoding = 'async';
+    img.onload = () => {
+      state.referenceAtlas = img;
+      $('referenceToggle').classList.remove('hidden');
+      $('referenceToggle').setAttribute('aria-pressed', String(state.showReference));
+    };
+    img.onerror = () => {
+      state.referenceAtlas = null;
+      $('referenceToggle').classList.add('hidden');
+    };
+    img.src = '/api/reference-model/atlas';
+    try {
+      const info = await getJSON('/api/reference-model');
+      state.referenceInfo = info;
+      if (!info.available) {
+        state.referenceAtlas = null;
+        $('referenceToggle').classList.add('hidden');
+      }
+      // The local auto-rig is opt-in: the default stage stays on the proven
+      // Canvas mannequin because the source sculpt has no original skin weights.
+      const rigOptIn = /(?:^|[?&])rig=1(?:&|$)/.test(window.location.search);
+      if (info.rigged && rigOptIn) {
+        loadRiggedSculpt(info).catch(() => {
+          state.dancer3DActive = false;
+          state.dancer3D = null;
+          $('rigStatus').classList.add('hidden');
+        });
+      }
+    } catch (_) {
+      /* The atlas tile and rig are optional; the recorded-pose dancer remains available. */
+    }
+  }
+
   async function loadDemoInfo() {
     try {
       const info = await getJSON('/api/demo-info');
@@ -567,7 +888,7 @@
 
   function setProgress(pct, text, stage) {
     $('progressPanel').classList.remove('hidden');
-    $('progressBar').style.width = `${pct}%`;
+    $('progressBar').style.setProperty('--progress', String(pct / 100));
     $('progressPct').textContent = `${pct}%`;
     $('progressText').textContent = text;
     $('stageLoadingText').textContent = text;
@@ -759,6 +1080,11 @@
     $('metricsBody').textContent = stat('body');
     $('metricsHands').textContent = stat('hands');
     $('metricsFoot').textContent = stat('foot_sliding');
+    const m = job.mudra_planning || {};
+    $('metricsMudra').textContent = m.enabled ? `${m.annotated_units ?? 0} units` : 'off';
+    $('metricsMudraBasis').textContent = m.enabled
+      ? `${m.basis || 'hand-shape prior'} · ${(m.selected_labels || []).length} labels`
+      : 'no trained annotations available';
   }
 
   function renderTimeline(events) {
@@ -917,9 +1243,54 @@
     $('demoBtn').addEventListener('click', () => { setDemo(); toast('Demo clip loaded. Generate to see the dancer.'); });
     $('heroDemoBtn').addEventListener('click', () => {
       setDemo();
-      $('studio').scrollIntoView({ behavior: 'smooth' });
+      $('studio').scrollIntoView({
+        behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+      });
       toast('Demo clip loaded in the studio.');
     });
+
+    $('referenceToggle').addEventListener('click', () => {
+      state.showReference = !state.showReference;
+      $('referenceToggle').setAttribute('aria-pressed', String(state.showReference));
+    });
+
+    const menuToggle = $('menuToggle');
+    const menuPanel = $('menuPanel');
+    const setMenuOpen = (open) => {
+      menuToggle.setAttribute('aria-expanded', String(open));
+      menuToggle.setAttribute('aria-label', open ? 'Close navigation menu' : 'Open navigation menu');
+      menuPanel.setAttribute('aria-hidden', String(!open));
+      menuPanel.classList.toggle('is-open', open);
+      document.body.classList.toggle('menu-open', open);
+      if (open) menuPanel.querySelector('a').focus();
+      else menuToggle.focus();
+    };
+    menuToggle.addEventListener('click', () => {
+      setMenuOpen(menuToggle.getAttribute('aria-expanded') !== 'true');
+    });
+    menuPanel.querySelectorAll('a').forEach((link) => {
+      link.addEventListener('click', () => setMenuOpen(false));
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && menuToggle.getAttribute('aria-expanded') === 'true') setMenuOpen(false);
+    });
+
+    if ('IntersectionObserver' in window) {
+      const revealObserver = new IntersectionObserver((entries, observer) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          entry.target.classList.add('is-visible');
+          observer.unobserve(entry.target);
+        });
+      }, { rootMargin: '0px 0px -7% 0px', threshold: 0.08 });
+      document.querySelectorAll('.reveal, .reveal-scale, .slide-accent').forEach((element) => revealObserver.observe(element));
+      document.body.classList.add('motion-ready');
+
+      const navObserver = new IntersectionObserver(([entry]) => {
+        $('topbar').classList.toggle('is-scrolled', !entry.isIntersecting);
+      }, { threshold: 0.04 });
+      navObserver.observe(document.querySelector('.hero'));
+    }
 
     $('tempoGroup').addEventListener('click', (e) => {
       const b = e.target.closest('button[data-tempo]');
@@ -984,7 +1355,11 @@
       if (e.code === 'ArrowLeft' && $('audioEl').src) $('audioEl').currentTime -= 2;
     });
 
-    window.addEventListener('resize', resizeCanvas);
+    window.addEventListener('resize', () => {
+      resizeCanvas();
+      updateProcessStack();
+    });
+    window.addEventListener('scroll', updateProcessStack, { passive: true });
     if (window.ResizeObserver) new ResizeObserver(resizeCanvas).observe($('stageWrap'));
   }
 
@@ -999,4 +1374,6 @@
   loadCatalogue();
   loadJobs();
   loadDemoInfo();
+  loadReferenceModel();
+  updateProcessStack();
 })();

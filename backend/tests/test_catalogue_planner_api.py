@@ -158,6 +158,34 @@ def test_catalogue_planner_api_and_render_end_to_end(tmp_path: Path):
     assert all(abs(dt - 1.0 / 30.0) < 0.002 for dt in dts)
     assert abs(choreo_conf["duration_s"] - (choreo_conf["n_frames"] - 1) / 30.0) <= 0.002
     assert any(fr["left_hand_rel"] is None for fr in choreo_conf["frames"])
+    assert choreo_conf["mudra_planning"]["enabled"] is False
+    assert choreo_conf["transition_planning"]["enabled"] is False
+    assert choreo_conf["transition_planning"]["basis"] == "disabled"
+    assert all(ev["transition_score"] is None for ev in choreo_conf["timeline_events"])
+
+    # 1b. A supplied mudra prior is reported without changing frame timing or hand data.
+    mudra_annotations = {
+        u["unit_id"]: {
+            "labels": ["TestMudra"],
+            "left": {"confidence": 0.9},
+            "right": {"confidence": 0.9},
+        }
+        for u in cat["units"]
+    }
+    choreo_mudra = plan_choreography(
+        analysis,
+        cat,
+        root=proj,
+        fps=30.0,
+        include_unconfirmed=False,
+        exclude_stems={"Nattadavu1"},
+        mudra_annotations=mudra_annotations,
+        mudra_weight=2.0,
+    )
+    assert choreo_mudra["mudra_planning"]["enabled"] is True
+    assert choreo_mudra["mudra_planning"]["annotated_units"] == len(mudra_annotations)
+    assert all(ev["mudra_labels"] == ["TestMudra"] for ev in choreo_mudra["timeline_events"])
+    assert len(choreo_mudra["frames"]) == len(choreo_conf["frames"])
 
     # 2. Test include_unconfirmed=True enables ThaThaiThamAdavu
     choreo_unconf = plan_choreography(
@@ -192,6 +220,8 @@ def test_catalogue_planner_api_and_render_end_to_end(tmp_path: Path):
     assert "Nattadavu1" not in body["source_stems_used"]
     assert "ThaThaiThamAdavu" not in body["adavus_used"]
     assert body["frame_quantization_check_ms"]["median_ms"] <= 25.0
+    assert body["mudra_planning"]["enabled"] is False
+    assert body["transition_planning"]["enabled"] is False
 
     r_get = client.get(f"/api/choreography/{body['job_id']}")
     assert r_get.status_code == 200
@@ -223,3 +253,85 @@ def test_catalogue_planner_api_and_render_end_to_end(tmp_path: Path):
     assert r_render.json()["video_url"] == f"/api/media/{body['job_id']}/preview.mp4"
     r_preview = client.get(r_render.json()["video_url"])
     assert r_preview.status_code == 200 and len(r_preview.content) > 0
+
+
+def test_model_info_endpoint_without_local_artifacts(tmp_path: Path):
+    proj = _make_synthetic_project(tmp_path)
+    client = TestClient(create_app(root=proj))
+
+    info = client.get("/api/model-info")
+    assert info.status_code == 200
+    body = info.json()
+    assert body["available"] is False
+    assert body["version"] is None
+    assert body["annotations"]["available"] is False
+    assert body["annotations"]["unit_count"] == 0
+    assert body["transition_prior"]["available"] is False
+    assert body["transition_prior"]["summaries_available"] is False
+
+    ann_path = proj / "data" / "catalogue" / "mudra_annotations.json"
+    ann_path.parent.mkdir(parents=True, exist_ok=True)
+    ann_path.write_text(
+        json.dumps({"units": {"u1": {"labels": ["Sikharam"]}}}),
+        encoding="utf-8",
+    )
+    body = client.get("/api/model-info").json()
+    assert body["annotations"]["available"] is True
+    assert body["annotations"]["unit_count"] == 1
+    assert body["annotations"]["label_count"] == 1
+
+    health = client.get("/api/health").json()
+    assert health["mudra_model"]["available"] is False
+    assert health["mudra_model"]["annotations"]["unit_count"] == 1
+    assert health["transition_prior"]["available"] is False
+
+    # The FBX-derived reference is optional and never required for generation.
+    reference = client.get("/api/reference-model")
+    assert reference.status_code == 200
+    assert reference.json()["available"] is False
+    assert reference.json()["atlas_url"] is None
+    assert reference.json()["rigged"] is False
+    assert client.get("/api/reference-model/atlas").status_code == 404
+    assert client.get("/api/reference-model/glb").status_code == 404
+    assert health["reference_model"]["available"] is False
+
+    atlas_path = (
+        proj / "data" / "imported_models" / "bharathanatyam-dancer" / "derived"
+        / "bharatanatyam_turntable_atlas_4x4_512.png"
+    )
+    atlas_path.parent.mkdir(parents=True, exist_ok=True)
+    atlas_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    (atlas_path.parent / "bharatanatyam_turntable_manifest.json").write_text(
+        json.dumps({"frame_count": 16, "grid": {"columns": 4, "rows": 4}, "tile_size": 512}),
+        encoding="utf-8",
+    )
+    reference = client.get("/api/reference-model").json()
+    assert reference["available"] is True
+    assert reference["atlas_url"] == "/api/reference-model/atlas"
+    assert reference["frame_count"] == 16
+    assert reference["grid"] == {"columns": 4, "rows": 4}
+    assert client.get("/api/reference-model/atlas").content == b"\x89PNG\r\n\x1a\n"
+
+    rig_path = atlas_path.parent / "bharatanatyam_dancer_rigged.glb"
+    rig_path.write_bytes(b"glTF")
+    (atlas_path.parent / "bharatanatyam_rig_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": "nritya-fbx-autorig-v1",
+                "bone_names": ["hips", "spine"],
+                "bone_targets": {"hips": {"from": "hip_center", "to": "chest"}},
+                "rest_direction": {"hips": [0.0, 1.0, 0.0]},
+                "rest_positions": {"hips": {"head": [0.0, 0.0, 0.0]}},
+                "joint_indices": {"left_hip": 23},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reference = client.get("/api/reference-model").json()
+    assert reference["rigged"] is True
+    assert reference["rig"]["glb_url"] == "/api/reference-model/glb"
+    assert reference["rig"]["manifest"]["bone_names"] == ["hips", "spine"]
+    assert client.get("/api/reference-model/glb").content == b"glTF"
+    health = client.get("/api/health").json()["reference_model"]
+    assert health["available"] is True
+    assert health["rigged"] is True

@@ -1,6 +1,11 @@
 # === Dataset, extracted motion, model weights, previews, audio, catalogues (local only) ===
 data/
 models/weights/
+# Locally trained artifacts: reproducible from scripts/, never committed.
+models/mudra_landmark_classifier.joblib
+models/mudra_landmark_classifier.json
+models/transition_prior.joblib
+models/transition_prior.json
 output/
 previews/
 *.mp4

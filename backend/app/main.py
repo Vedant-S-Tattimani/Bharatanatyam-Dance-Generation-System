@@ -9,6 +9,10 @@ Endpoints:
   GET  /api/choreography/{job_id}   – Fetch a previously generated choreography JSON by job ID
   POST /api/choreography/{job_id}/render – Render a saved job into an MP4 animation
   GET  /api/jobs                    – List recent generations
+  GET  /api/model-info              – Trained mudra and recorded-join prior status and metrics
+  GET  /api/reference-model          – FBX sculpt atlas and auto-rig metadata (when present)
+  GET  /api/reference-model/atlas    – Transparent 4x4 turntable atlas PNG bytes
+  GET  /api/reference-model/glb      – Auto-rigged skinned GLB bytes (when present)
   GET  /api/demo-audio              – Bundled demo excerpt (when present)
   GET  /                            – Nritya web studio (when frontend is installed)
 """
@@ -31,7 +35,9 @@ import torch
 
 from app.audio.analyzer import analyze_audio
 from app.catalogue.builder import build_catalogue, load_catalogue
+from app.motion.mudra import MudraClassifier, annotation_summary, load_annotations
 from app.motion.preview import render_choreography_video
+from app.motion.transition_prior import TransitionPrior
 from app.planner.choreographer import plan_choreography
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -64,6 +70,69 @@ def create_app(
     frontend_dir = root / "frontend"
     assets_dir = frontend_dir / "assets"
     demo_audio_path = root / "data" / "samples" / "demo.mp3"
+    model_path = root / "models" / "mudra_landmark_classifier.joblib"
+    model_meta_path = root / "models" / "mudra_landmark_classifier.json"
+    mudra_annotation_path = root / "data" / "catalogue" / "mudra_annotations.json"
+    reference_dir = root / "data" / "imported_models" / "bharathanatyam-dancer" / "derived"
+    reference_atlas_path = reference_dir / "bharatanatyam_turntable_atlas_4x4_512.png"
+    reference_manifest_path = reference_dir / "bharatanatyam_turntable_manifest.json"
+    reference_glb_path = reference_dir / "bharatanatyam_dancer_rigged.glb"
+    reference_rig_manifest_path = reference_dir / "bharatanatyam_rig_manifest.json"
+    classifier = MudraClassifier(model_path, model_meta_path)
+    transition_prior = TransitionPrior(
+        root / "models" / "transition_prior.joblib",
+        root / "models" / "transition_prior.json",
+        root / "data" / "catalogue" / "transition_features.json",
+    )
+
+    def _model_info() -> dict[str, Any]:
+        return {
+            "available": classifier.available,
+            "version": classifier.version if classifier.available else None,
+            "load_error": classifier.load_error,
+            "metadata": classifier.metadata or None,
+            "annotations": annotation_summary(root, mudra_annotation_path),
+            "transition_prior": transition_prior.status(),
+        }
+
+    def _reference_info() -> dict[str, Any]:
+        """Describe the local derived sculpt atlas and optional auto-rig."""
+        available = reference_atlas_path.is_file()
+        manifest: dict[str, Any] = {}
+        if reference_manifest_path.is_file():
+            try:
+                loaded = json.loads(reference_manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    manifest = loaded
+            except (OSError, ValueError):
+                manifest = {}
+        grid = manifest.get("grid") if isinstance(manifest.get("grid"), dict) else None
+
+        rig_manifest: dict[str, Any] = {}
+        if reference_rig_manifest_path.is_file():
+            try:
+                loaded_rig = json.loads(reference_rig_manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_rig, dict):
+                    rig_manifest = loaded_rig
+            except (OSError, ValueError):
+                rig_manifest = {}
+        rigged = reference_glb_path.is_file() and bool(rig_manifest)
+        return {
+            "available": available,
+            "atlas_url": "/api/reference-model/atlas" if available else None,
+            "atlas_file": reference_atlas_path.name if available else None,
+            "frame_count": manifest.get("frame_count") if available else None,
+            "grid": grid if available else None,
+            "tile_size": manifest.get("tile_size") if available else None,
+            "basis": "Static FBX sculpt turntable; no armature, animation, or recorded dance motion.",
+            "rigged": rigged,
+            "rig": {
+                "available": rigged,
+                "glb_url": "/api/reference-model/glb" if rigged else None,
+                "glb_file": reference_glb_path.name if rigged else None,
+                "manifest": rig_manifest if rigged else None,
+            },
+        }
 
     app = FastAPI(title="Nritya Bharatanatyam Choreography API", version="1.0.0")
     app.add_middleware(
@@ -95,6 +164,17 @@ def create_app(
             "catalogue": cat_summary,
             "frontend_available": (frontend_dir / "index.html").is_file(),
             "demo_audio_available": demo_audio_path.is_file(),
+            "mudra_model": {
+                "available": classifier.available,
+                "version": classifier.version if classifier.available else None,
+                "annotations": annotation_summary(root, mudra_annotation_path),
+            },
+            "transition_prior": {
+                "available": transition_prior.available,
+                "version": transition_prior.version if transition_prior.available else None,
+                "summaries_available": transition_prior.summaries_available,
+            },
+            "reference_model": _reference_info(),
         }
 
     @app.get("/api/catalogue")
@@ -171,6 +251,7 @@ def create_app(
                 offset_ms=offset_ms,
             )
             allowed_set = {a.strip() for a in allowed_adavus.split(",") if a.strip()} or None
+            mudra_annotations = load_annotations(root, mudra_annotation_path)
             choreo = plan_choreography(
                 audio_analysis=analysis,
                 catalogue=cat,
@@ -180,6 +261,8 @@ def create_app(
                 include_unconfirmed=include_unconfirmed,
                 exclude_stems=excluded_set,
                 seed=seed,
+                mudra_annotations=mudra_annotations or None,
+                transition_prior=transition_prior if transition_prior.available else None,
             )
         finally:
             tmp_media.unlink(missing_ok=True)
@@ -203,6 +286,8 @@ def create_app(
             "frame_quantization_check_ms": result["frame_quantization_check_ms"],
             "planned_foot_strikes_vs_beats": result["planned_foot_strikes_vs_beats"],
             "transition_metrics": result["transition_metrics"],
+            "mudra_planning": result["mudra_planning"],
+            "transition_planning": result["transition_planning"],
             "timeline_events": result["timeline_events"],
             "frames": result["frames"],
         }
@@ -217,6 +302,27 @@ def create_app(
         data = json.loads(job_file.read_text(encoding="utf-8"))
         data["source_available"] = bool(sorted((out_dir / job_id).glob("source.*")))
         return data
+
+    @app.get("/api/reference-model")
+    def reference_model_info() -> dict[str, Any]:
+        """Describe the optional FBX-derived atlas and auto-rigged sculpt."""
+        return _reference_info()
+
+    @app.get("/api/reference-model/atlas", include_in_schema=False)
+    def reference_model_atlas() -> FileResponse:
+        if not reference_atlas_path.is_file():
+            raise HTTPException(status_code=404, detail="No static sculpt atlas available")
+        return FileResponse(reference_atlas_path, media_type="image/png", filename=reference_atlas_path.name)
+
+    @app.get("/api/reference-model/glb", include_in_schema=False)
+    def reference_model_glb() -> FileResponse:
+        if not reference_glb_path.is_file() or not reference_rig_manifest_path.is_file():
+            raise HTTPException(status_code=404, detail="No auto-rigged sculpt available")
+        return FileResponse(
+            reference_glb_path,
+            media_type="model/gltf-binary",
+            filename=reference_glb_path.name,
+        )
 
     @app.get("/api/demo-info")
     def demo_info() -> dict[str, Any]:
@@ -257,6 +363,11 @@ def create_app(
                 "source_available": bool(sorted((out_dir / job_file.stem).glob("source.*"))),
             })
         return jobs
+
+    @app.get("/api/model-info")
+    def model_info() -> dict[str, Any]:
+        """Describe the locally trained mudra and recorded-join priors."""
+        return _model_info()
 
     @app.post("/api/choreography/{job_id}/render")
     def render_choreography_job(

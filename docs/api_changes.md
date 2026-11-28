@@ -1,6 +1,6 @@
 # Backend API Field & Contract Changes (for `frontend/`)
 
-Last updated: Phase 2 website/retained-media revision (`backend/app/main.py`, `backend/app/audio/analyzer.py`, `backend/app/planner/choreographer.py`, `backend/app/motion/preview.py`)
+Last updated: Phase 4 opt-in auto-rigged FBX/WebGL revision (`backend/app/main.py`, `backend/tests/test_catalogue_planner_api.py`, `frontend/index.html`, `frontend/assets/app.js`, `frontend/assets/dancer3d.js`, `frontend/assets/portfolio.css`)
 
 ---
 
@@ -38,6 +38,22 @@ Last updated: Phase 2 website/retained-media revision (`backend/app/main.py`, `b
     - `GET /api/jobs?limit=20` returns recent saved jobs with `source_file`, tempo, tala, duration, phrase count, adavus used, and `source_available`.
 14. **Compact generate response**
     - `POST /api/choreography/generate` intentionally omits `audio_analysis`, `affect`, and `affect_timeline`; fetch `GET /api/choreography/{job_id}` for those fields.
+15. **Procedural female renderer (`frontend`, no API shape change)**
+    - The Canvas 2D stage now projects a female mannequin from `pose_world`; hand fingers are drawn only from genuine `left_hand_rel` / `right_hand_rel` values. `null` hand landmarks remain `null`.
+16. **Bounded mudra hand-shape prior (`NEW`)**
+    - When local classifier artifacts and catalogue annotations exist, the planner uses them as a small hand-shape ranking term. Results include `mudra_planning`, and timeline events include `mudra_labels` / `mudra_confidence`. Missing artifacts are inert: generation still works with `mudra_planning.enabled: false`.
+    - This is not a music-to-expert-choreography model and makes no claim of correct choreography for every song.
+17. **`GET /api/model-info` (`NEW`)**
+    - Reports mudra classifier availability, version, metadata, load error, and annotation coverage. `GET /api/health` also includes a compact `mudra_model` summary.
+18. **Bounded recorded-join transition prior (`NEW`)**
+    - When the local model and boundary-summary artifacts exist, the planner adds a small `(1 - natural-join probability)` join-ordering cost. Results include `transition_planning`, timeline events include `transition_score`, and generate responses include the same summary.
+    - This is a source-held-out prior over recorded motion flow, not expert choreography supervision. Missing artifacts are inert: generation still works with `transition_planning.enabled: false`.
+19. **Prior status expansion (`NEW`)**
+    - `GET /api/model-info` adds `transition_prior` with split availability (`model_available`, `summaries_available`), version, metadata, and held-out metrics. `GET /api/health` adds a compact `transition_prior` summary.
+20. **FBX reference and auto-rig endpoints (`NEW`)**
+    - `GET /api/reference-model` reports availability of the local derived atlas and its grid metadata, plus `rigged` and a nested `rig` descriptor (URL, file name, retarget manifest) when the auto-rigged GLB is present.
+    - `GET /api/reference-model/atlas` serves the fixed PNG bytes or returns HTTP `404` when absent. `GET /api/reference-model/glb` serves the auto-rigged skinned GLB bytes or returns HTTP `404` when absent.
+    - `GET /api/health` adds `reference_model`. The frontend draws atlas frame `0` as a labelled static inset with a toggle and, when the rig assets exist, drives the skinned sculpt from recorded `pose_world` directions in WebGL. The rig is approximate and does not synthesize hand landmarks. Generation is unchanged when artifacts are missing.
 
 ---
 
@@ -56,9 +72,42 @@ Response:
     "adavu_categories": ["KudithuMettuAdavu", "Nattadavu", "ThaThaiThamAdavu", "ThaiyaThaihiAdavu"]
   },
   "frontend_available": true,
-  "demo_audio_available": true
+  "demo_audio_available": true,
+  "mudra_model": {
+    "available": true,
+    "version": "nritya-mudra-landmark-v1",
+    "annotations": {
+      "path": "data/catalogue/mudra_annotations.json",
+      "available": true,
+      "unit_count": 459,
+      "label_count": 25
+    }
+  },
+  "transition_prior": {
+    "available": true,
+    "version": "nritya-recorded-join-v1",
+    "summaries_available": true
+  },
+  "reference_model": {
+    "available": true,
+    "atlas_url": "/api/reference-model/atlas",
+    "atlas_file": "bharatanatyam_turntable_atlas_4x4_512.png",
+    "frame_count": 16,
+    "grid": { "columns": 4, "rows": 4 },
+    "tile_size": 512,
+    "basis": "Static FBX sculpt turntable; no armature, animation, or recorded dance motion.",
+    "rigged": true,
+    "rig": {
+      "available": true,
+      "glb_url": "/api/reference-model/glb",
+      "glb_file": "bharatanatyam_dancer_rigged.glb",
+      "manifest": { "version": "nritya-fbx-autorig-v1", "bone_names": ["hips", "spine"] }
+    }
+  }
 }
 ```
+
+The `manifest` object above is abbreviated; the live response includes all 19 deform bone names, Blender-space rest positions/directions, `bone_targets`, `joint_indices`, and explicit `limitations`.
 
 ### `GET /api/catalogue`
 Query parameters:
@@ -115,8 +164,12 @@ Response fields (compact — `audio_analysis`, `affect`, and `affect_timeline` a
   `{ strike_count, beat_count, median_ms, mean_ms, max_ms, median_frames, max_frames, beat_source, beat_period_ms, err_frac_of_period, same_tempo_random_baseline_ms }`
 - `transition_metrics`:
   `{ transition_count, body: {count, median_torso, max_torso}, hands: {count, median_torso, max_torso}, foot_sliding: {count, median_torso, max_torso} }`
+- `mudra_planning` *(NEW)*:
+  `{ enabled, weight, annotated_units, selected_labels, basis }`. `basis` is `"trained-hand-shape-prior"` when local annotations are used, otherwise `"disabled"`.
+- `transition_planning` *(NEW)*:
+  `{ enabled, weight, model, scored_joins, mean_score, basis, scope }`. `basis` is `"trained-recorded-join-prior"` when the local model and summaries are used, otherwise `"disabled"`. `enabled` only means the bounded join cost was available.
 - `timeline_events[]`:
-  `{ time_s, unit_id, adavu, confirmed, source_stem, is_phrase_start, song_beat_index }`
+  `{ time_s, unit_id, adavu, confirmed, source_stem, is_phrase_start, song_beat_index, mudra_labels, mudra_confidence, transition_score }` (the last three fields are `NEW`).
 - `frames[]`:
   `{ f, t, adavu, source_stem, confirmed, pose_world (33x3), travel_x, jump_y, foot_l_y, foot_r_y, left_hand_rel (21x3 | null), right_hand_rel (21x3 | null) }`
   > **Important:** `left_hand_rel` and `right_hand_rel` are `null` whenever no genuine hand detection existed in the source frame. Do **not** synthesize finger poses for `null` frames in the 3D frontend.
@@ -145,6 +198,88 @@ Query: `limit: int = 20` (clamped to `1..100`). Returns newest-first `dict[]`:
   "source_available": true
 }
 ```
+
+### `GET /api/model-info`
+Returns the locally trained mudra hand-shape and recorded-join prior status:
+
+```json
+{
+  "available": true,
+  "version": "nritya-mudra-landmark-v1",
+  "load_error": null,
+  "metadata": {
+    "model_id": "nritya-mudra-landmark-v1",
+    "dataset": { "repo_id": "Samarth0710/bharatanatyam-mudra-dataset", "revision": "...", "license": "MIT" },
+    "metrics": { "accuracy": 0.7026, "balanced_accuracy": 0.7046, "macro_f1": 0.6947, "weighted_f1": 0.6968 }
+  },
+  "annotations": {
+    "path": "data/catalogue/mudra_annotations.json",
+    "available": true,
+    "unit_count": 459,
+    "label_count": 25
+  },
+  "transition_prior": {
+    "available": true,
+    "version": "nritya-recorded-join-v1",
+    "load_error": null,
+    "model_available": true,
+    "summaries_available": true,
+    "summary_unit_count": 459,
+    "summary_path": "data/catalogue/transition_features.json",
+    "metadata": {
+      "model_id": "nritya-recorded-join-v1",
+      "metrics": {
+        "accuracy": 0.9644,
+        "balanced_accuracy": 0.9684,
+        "roc_auc": 0.9962,
+        "average_precision": 0.993
+      }
+    }
+  }
+}
+```
+
+`metadata` is `null` and `version` is `null` when the gitignored local artifacts are absent; `annotations.available` and counts are then `false` / `0`. `transition_prior.available` requires both the model and boundary summaries; generation does not require either artifact. These metrics measure recorded-adjacency separation, not expert choreography quality.
+
+### `GET /api/reference-model`
+Returns metadata for the optional sculpt atlas and auto-rigged GLB derived from the supplied FBX. This endpoint is read-only and does not generate artifacts.
+
+```json
+{
+  "available": true,
+  "atlas_url": "/api/reference-model/atlas",
+  "atlas_file": "bharatanatyam_turntable_atlas_4x4_512.png",
+  "frame_count": 16,
+  "grid": { "columns": 4, "rows": 4 },
+  "tile_size": 512,
+  "basis": "Static FBX sculpt turntable; no armature, animation, or recorded dance motion.",
+  "rigged": true,
+  "rig": {
+    "available": true,
+    "glb_url": "/api/reference-model/glb",
+    "glb_file": "bharatanatyam_dancer_rigged.glb",
+    "manifest": {
+      "version": "nritya-fbx-autorig-v1",
+      "bind_method": ["ARMATURE_AUTO", "NEAREST_SEGMENT_FALLBACK:18", "NEAREST_SEGMENT:18"],
+      "bone_names": ["hips", "spine", "chest", "neck", "head", "shoulder.L", "upper_arm.L", "forearm.L", "hand.L", "shoulder.R", "upper_arm.R", "forearm.R", "hand.R", "thigh.L", "shin.L", "foot.L", "thigh.R", "shin.R", "foot.R"],
+      "bone_targets": { "upper_arm.L": { "from": "left_shoulder", "to": "left_elbow" } },
+      "joint_indices": { "left_shoulder": 11, "left_elbow": 13, "left_wrist": 15 },
+      "synthetic_joints": ["hip_center", "chest", "neck"],
+      "model_height_m": 1.48,
+      "depth_offset_m": -0.10,
+      "limitations": ["Finger poses are not synthesized; only recorded body/wrist directions drive bones."]
+    }
+  }
+}
+```
+
+When artifacts are absent, `available` / `rigged` are `false`, URL/file/count fields are `null`, and the renderer falls back to the procedural mannequin. When artifacts are present, the procedural mannequin is still the default stage; the rigged sculpt is used only when the studio URL includes `?rig=1`. The atlas is a 2048×2048 RGBA PNG with 16 row-major 512 px tiles; frame `N` is column `N % 4`, row `N // 4`. The studio draws frame `0` only as a labelled inset. It is a camera turntable of one sculpt pose, not dance motion or mudra supervision.
+
+### `GET /api/reference-model/atlas`
+Returns the fixed PNG bytes as `image/png`, or HTTP `404` when the atlas file is missing. It is served only from `data/imported_models/bharathanatyam-dancer/derived/`.
+
+### `GET /api/reference-model/glb`
+Returns the locally auto-rigged skinned GLB bytes as `model/gltf-binary`, or HTTP `404` when either the GLB or its retarget manifest is missing. The file is served only from `data/imported_models/bharathanatyam-dancer/derived/`. When the studio URL includes `?rig=1`, the browser loader binds the 19 deform bones by name and rotates them from recorded `pose_world` joint directions; the default stage remains the procedural Canvas mannequin. Skin weights were derived locally from bone heat with nearest-segment fallback and are approximate. No finger animation is synthesized.
 
 ### `GET /api/demo-info`
 Returns `{ available, filename, stem, description }` for the optional local `data/samples/demo.mp3`. The file is gitignored; `available: false` is normal on a fresh clone.

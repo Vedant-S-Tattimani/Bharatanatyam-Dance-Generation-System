@@ -8,6 +8,8 @@ missing hand poses, and measures:
   - Frame quantization check: timeline events vs detected/verified beats (<= 25ms median, <= 60ms max)
   - Planned foot strikes vs song beats (against same-tempo chance, labeled verified vs unverified)
   - Separate transition jumps: body, hands (real detections only), and stance foot sliding
+  - Optional bounded mudra prior from a trained landmark classifier (never an expert-choreography label)
+  - Optional bounded recorded-join prior from trained boundary-flow features (join ordering only)
 """
 
 from __future__ import annotations
@@ -89,6 +91,10 @@ def _select_unit_sequence(
     energy_curve: list[float] | None = None,
     song_duration_s: float = 0.0,
     seed: int = 42,
+    mudra_annotations: dict[str, Any] | None = None,
+    mudra_weight: float = 0.35,
+    transition_prior: Any | None = None,
+    transition_weight: float = 0.35,
 ) -> list[dict[str, Any]]:
     """Greedily schedule phrase units over song beat windows optimizing tempo, pose, hand continuity, and variety."""
     excluded_norm = {s.lower() for s in (exclude_stems or set()) if s}
@@ -114,9 +120,11 @@ def _select_unit_sequence(
 
     recent_adavus: list[str] = []
     recent_stems: list[str] = []
+    prev_unit: dict[str, Any] | None = None
     prev_end_pose: list[list[float]] = []
     prev_end_lh: list[list[float]] | None = None
     prev_end_rh: list[list[float]] | None = None
+    prev_mudra_labels: set[str] = set()
 
     while idx_queue or cur < n_beats - 1:
         if idx_queue:
@@ -133,8 +141,16 @@ def _select_unit_sequence(
         )
         best_score = float("inf")
         best_unit: dict[str, Any] | None = None
+        best_cand_i = -1
+        transition_scores: list[float | None] = [None] * len(pool)
+        if (
+            prev_unit is not None
+            and transition_prior is not None
+            and getattr(transition_prior, "available", False)
+        ):
+            transition_scores = transition_prior.score_many(prev_unit, pool)
 
-        for u in pool:
+        for cand_i, u in enumerate(pool):
             u_intervals = len(u["beat_times_s"]) - 1
             length_pen = 0.0 if u_intervals >= n_intervals else (n_intervals - u_intervals) * 1.2
             tempo_pen = abs(math.log2(max(song_bpm, 30.0) / max(float(u["bpm"]), 30.0))) * 1.5
@@ -154,19 +170,45 @@ def _select_unit_sequence(
                 abs(ADAVU_ENERGY.get(u["adavu"], 0.5) - target_energy) * 0.9
                 if target_energy is not None else 0.0
             )
+            mudra_term = 0.0
+            if mudra_annotations:
+                ann = mudra_annotations.get(str(u["unit_id"]), {})
+                labels = [str(x) for x in ann.get("labels", []) if x]
+                if labels:
+                    confidence = max(
+                        float(ann.get(side, {}).get("confidence", 0.0)) for side in ("left", "right")
+                    )
+                    mudra_term -= mudra_weight * 0.25 * confidence
+                    if prev_mudra_labels:
+                        mudra_term += mudra_weight * 0.20 * len(prev_mudra_labels.intersection(labels))
+            join_score = transition_scores[cand_i] if cand_i < len(transition_scores) else None
+            transition_term = (
+                transition_weight * (1.0 - float(join_score)) if join_score is not None else 0.0
+            )
             jitter = float(rng.uniform(0.0, 0.03))
             score = (
                 length_pen + tempo_pen + pose_pen + hand_pen + hand_bonus
-                + repeat_pen + energy_pen + jitter
+                + repeat_pen + energy_pen + mudra_term + transition_term + jitter
             )
             if score < best_score:
                 best_score = score
                 best_unit = u
+                best_cand_i = cand_i
 
         assert best_unit is not None
         used_intervals = min(n_intervals, len(best_unit["beat_times_s"]) - 1)
         target_beats = beat_times[w_start : w_start + used_intervals + 1]
         src_beats = best_unit["beat_times_s"][: used_intervals + 1]
+        best_ann = (mudra_annotations or {}).get(str(best_unit["unit_id"]), {})
+        best_mudra_labels = [str(x) for x in best_ann.get("labels", []) if x]
+        best_mudra_confidence = max(
+            (float(best_ann.get(side, {}).get("confidence", 0.0)) for side in ("left", "right")),
+            default=0.0,
+        )
+        best_join_score = (
+            transition_scores[best_cand_i]
+            if 0 <= best_cand_i < len(transition_scores) else None
+        )
         schedule.append({
             "unit": best_unit,
             "song_beat_start_idx": w_start,
@@ -174,17 +216,22 @@ def _select_unit_sequence(
             "target_beats_s": target_beats,
             "src_beats_s": src_beats,
             "target_energy": round(target_energy, 4) if target_energy is not None else None,
+            "mudra_labels": best_mudra_labels,
+            "mudra_confidence": round(best_mudra_confidence, 4),
+            "transition_score": round(float(best_join_score), 4) if best_join_score is not None else None,
         })
         if w_start >= cur:
             cur = w_start + used_intervals
         elif w_start + used_intervals < w_end:
             idx_queue.insert(0, (w_start + used_intervals, w_end))
 
+        prev_unit = best_unit
         prev_end_pose = best_unit["end_pose"]
         prev_end_lh = best_unit.get("end_left_hand")
         prev_end_rh = best_unit.get("end_right_hand")
         recent_adavus.append(best_unit["adavu"])
         recent_stems.append(best_unit["source_stem"])
+        prev_mudra_labels = set(best_mudra_labels)
 
     return schedule
 
@@ -456,6 +503,10 @@ def plan_choreography(
     exclude_stems: set[str] | None = None,
     blend_frames: int = 10,
     seed: int = 42,
+    mudra_annotations: dict[str, Any] | None = None,
+    mudra_weight: float = 0.35,
+    transition_prior: Any | None = None,
+    transition_weight: float = 0.35,
 ) -> dict[str, Any]:
     """
     Generate a constant-FPS, beat-synchronized choreography timeline for an analyzed song.
@@ -482,6 +533,10 @@ def plan_choreography(
         energy_curve=audio_analysis.get("energy_curve"),
         song_duration_s=float(audio_analysis.get("duration_s") or 0.0),
         seed=seed,
+        mudra_annotations=mudra_annotations,
+        mudra_weight=mudra_weight,
+        transition_prior=transition_prior,
+        transition_weight=transition_weight,
     )
     if not schedule:
         raise RuntimeError("No matching phrase units available in catalogue for the song beat grid.")
@@ -548,6 +603,9 @@ def plan_choreography(
                 "source_stem": unit["source_stem"],
                 "is_phrase_start": (b_idx == 0),
                 "song_beat_index": item["song_beat_start_idx"] + b_idx,
+                "mudra_labels": item["mudra_labels"],
+                "mudra_confidence": item["mudra_confidence"],
+                "transition_score": item.get("transition_score"),
             })
 
     # Apply symmetric boundary smoothing after full constant-FPS frame assembly
@@ -571,6 +629,12 @@ def plan_choreography(
     )
 
     duration_s = round((len(all_frames) - 1) / fps, 3) if len(all_frames) >= 2 else 0.0
+    transition_scores = [
+        float(s["transition_score"]) for s in schedule if s.get("transition_score") is not None
+    ]
+    transition_enabled = bool(
+        transition_prior is not None and getattr(transition_prior, "available", False)
+    )
     return {
         "song_bpm": round(song_bpm, 2),
         "tala": audio_analysis.get("tala", "Adi"),
@@ -596,6 +660,22 @@ def plan_choreography(
         "frame_quantization_check_ms": frame_quantization,
         "planned_foot_strikes_vs_beats": planned_strikes,
         "transition_metrics": transition_metrics,
+        "mudra_planning": {
+            "enabled": bool(mudra_annotations),
+            "weight": round(float(mudra_weight), 4),
+            "annotated_units": len(mudra_annotations or {}),
+            "selected_labels": sorted({label for s in schedule for label in s["mudra_labels"]}),
+            "basis": "trained-hand-shape-prior" if mudra_annotations else "disabled",
+        },
+        "transition_planning": {
+            "enabled": transition_enabled,
+            "weight": round(float(transition_weight), 4),
+            "model": getattr(transition_prior, "version", None) if transition_enabled else None,
+            "scored_joins": len(transition_scores),
+            "mean_score": round(float(np.mean(transition_scores)), 4) if transition_scores else None,
+            "basis": "trained-recorded-join-prior" if transition_enabled else "disabled",
+            "scope": "bounded join ordering from recorded motion; not expert choreography",
+        },
         "timeline_events": timeline_events,
         "frames": all_frames,
     }
